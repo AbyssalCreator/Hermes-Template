@@ -1265,7 +1265,7 @@
             <p class="hint" x-show="selectedProvider === 'AWS Bedrock'">e.g. <code>anthropic.claude-3-5-sonnet-20241022-v2:0</code>, <code>us.meta.llama3-2-90b-instruct-v1:0</code></p>
             <p class="hint" x-show="selectedProvider === 'Fireworks AI'">Format: <code>accounts/fireworks/models/&lt;model-id&gt;</code></p>
             <p class="hint" x-show="selectedProvider === 'MiniMax' || selectedProvider === 'MiniMax (China)'">e.g. <code>MiniMax-M3</code>, <code>MiniMax-M2.7</code></p>
-            <p class="hint" x-show="!['xAI Grok (SuperGrok)','xAI','Anthropic (Claude)','AWS Bedrock','Fireworks AI','MiniMax','MiniMax (China)','Custom Endpoint','Azure Foundry','9Router','OmniRoute'].includes(selectedProvider) && selectedProvider">Check your provider's docs for model names. OpenRouter format: <code>provider/model-name</code></p>
+            <p class="hint" x-show="!['xAI Grok (SuperGrok)','xAI','Anthropic (Claude)','AWS Bedrock','Fireworks AI','Atlas Cloud','MiniMax','MiniMax (China)','Custom Endpoint','Azure Foundry','9Router','OmniRoute'].includes(selectedProvider) && selectedProvider">Check your provider's docs for model names. OpenRouter format: <code>provider/model-name</code></p>
           </div>
         </div>
 
@@ -2385,6 +2385,7 @@ function app() {
       'Step Plan':            { key: 'STEPFUN_API_KEY',      modelKey: '_MODEL_STEPFUN_API_KEY',     placeholder: ''          },
       'Google AI Studio':     { key: 'GEMINI_API_KEY',         modelKey: '_MODEL_GEMINI_API_KEY',         placeholder: 'AIza...'   },
       'Fireworks AI':         { key: 'FIREWORKS_API_KEY',      modelKey: '_MODEL_FIREWORKS_API_KEY',      placeholder: 'fw_...'    },
+      'Atlas Cloud':          { key: 'ATLASCLOUD_API_KEY',     modelKey: '_MODEL_ATLASCLOUD_API_KEY',     placeholder: 'apikey-...', modelPlaceholder: 'e.g. deepseek-ai/deepseek-v4-flash', modelHint: 'Model IDs: GET https://api.atlascloud.ai/v1/models' },
       'Anthropic (Claude)':   { key: 'ANTHROPIC_API_KEY',      modelKey: '_MODEL_ANTHROPIC_API_KEY',      placeholder: 'sk-ant-...' },
       'xAI':                  { key: 'XAI_API_KEY',             modelKey: '_MODEL_XAI_API_KEY',             placeholder: 'xai-...', keyLabel: 'xAI API Key' },
       'AWS Bedrock':          { key: 'AWS_ACCESS_KEY_ID',       modelKey: '_MODEL_AWS_ACCESS_KEY_ID',       placeholder: 'AKIA...', isBedrock: true, keyLabel: 'AWS Access Key ID' },
