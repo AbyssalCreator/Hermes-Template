@@ -11,6 +11,14 @@ release.
 
 ---
 
+## release/v2026.9.24/2 — October 15, 2026
+**Hermes v2026.9.24 · minor**
+
+### Improvements
+- **Atlas Cloud** is now in the Setup provider dropdown (OpenAI-compatible gateway, `ATLASCLOUD_API_KEY`).
+
+---
+
 ## release/v2026.9.24/1 — October 6, 2026
 **Hermes v2026.9.24 · major (Hermes upgrade, from v2026.9.21)**
 
