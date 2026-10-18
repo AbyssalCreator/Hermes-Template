@@ -1,6 +1,6 @@
 starlette>=0.40.0
 # Floor tracks hermes' own core pin (>=0.31.0 since v2026.8.31, for CIDR-aware
-# forwarded_allow_ips) — same system site-packages, so keep them consistent.
+# forwarded_allow_ips). The image verifies these floors against its frozen base graph.
 uvicorn>=0.31.0
 jinja2>=3.1.0
 python-multipart>=0.0.9

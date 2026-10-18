@@ -345,7 +345,7 @@ class StartupMigrationTests(MigrationFixture, unittest.TestCase):
 
 @unittest.skipUnless(
     migration.UPSTREAM_MIGRATOR.is_file(),
-    "runs against the installed v2026.9.24 Hermes hook in the local Docker image",
+    "runs against the installed Hermes hook in the local Docker image",
 )
 class RealUpstreamHookTests(MigrationFixture, unittest.TestCase):
     """Exercise actual backup, migration, malformed-file, and idempotence behavior."""
@@ -363,7 +363,7 @@ class RealUpstreamHookTests(MigrationFixture, unittest.TestCase):
         migration.migrate(self.home)
         for home in (self.home, work):
             config = (home / "config.yaml").read_text(encoding="utf-8")
-            self.assertIn("_config_version: 46", config)
+            self.assertIn(f"_config_version: {migration._target_config_version(migration.UPSTREAM_MIGRATOR)}", config)
             self.assertIn("enabled: false", config)
             self.assertNotIn("disabled: true", config)
             backups = list((home / "backups" / "config").glob("config.yaml.pre-docker-migrate.*"))
@@ -383,7 +383,7 @@ class RealUpstreamHookTests(MigrationFixture, unittest.TestCase):
         work = self.profile("work", "_config_version: 45\n")
         migration.migrate(self.home)
         self.assertEqual(bad.read_text(), "mcp_servers: [\n")
-        self.assertIn("_config_version: 46", (work / "config.yaml").read_text())
+        self.assertIn(f"_config_version: {migration._target_config_version(migration.UPSTREAM_MIGRATOR)}", (work / "config.yaml").read_text())
 
     def test_real_hook_preserves_template_model_env_from_v12(self):
         (self.home / "config.yaml").write_text("_config_version: 12\nmodel:\n  default: config-model\n")

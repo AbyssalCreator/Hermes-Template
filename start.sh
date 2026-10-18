@@ -1,18 +1,18 @@
 #!/bin/bash
 set -e
 
-# Refuse links before first-boot cp/touch: both commands can follow a planted
-# config.yaml or .env link outside the mounted Hermes volume. The profile scan
-# below also rejects links, but it runs after these seed operations.
-for path in /data/.hermes /data/.hermes/config.yaml /data/.hermes/.env /data/.hermes/profiles; do
+# Refuse links before seeding directories/stamps. Config and .env are seeded
+# by the preparation worker only after interrupted PM publication is recovered.
+for path in /data/.hermes /data/.hermes/config.yaml /data/.hermes/.env /data/.hermes/profiles \
+            /data/.hermes/.install_method /data/.hermes/auth.json; do
   if [ -L "$path" ]; then
     echo "[template-config-migrate] ERROR: refusing symlinked Hermes path: $path" >&2
     exit 1
   fi
 done
 
-# Mirror dashboard-ref-only's startup: create every directory hermes expects
-# and seed a default config.yaml if the volume is empty. Without these,
+# Create the directories Hermes expects before the admin server starts.
+# The preparation worker seeds config only after journal recovery. Without these,
 # `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
 # with opaque errors even though no auth is actually involved.
 # NOTE (hermes >= v2026.7.1): several dirs were consolidated and are now
@@ -40,41 +40,14 @@ mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
 # HERMES_REF and redeploy. Rewrite this home stamp each boot to self-heal it.
 printf 'docker\n' > /data/.hermes/.install_method
 
-if [ ! -f /data/.hermes/config.yaml ] && [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
-  cp /opt/hermes-agent/cli-config.yaml.example /data/.hermes/config.yaml
-fi
+# PM now owns optional dependencies. Keep any legacy lazy-packages directory
+# intact for rollback, but never load its Python 3.12 extensions into 3.14.
+unset HERMES_LAZY_INSTALL_TARGET
 
-[ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
-
-# The template installs Hermes into system Python with no venv, so optional
-# runtime packages need a writable target instead of a bare `uv pip install`.
-# Keep that target on the volume and export it BEFORE migration: older schema
-# steps may import optional providers already installed there. The gateway and
-# dashboard inherit the same value; hermes_bootstrap.py activates it on start.
-mkdir -p /data/.hermes/lazy-packages
-export HERMES_LAZY_INSTALL_TARGET=/data/.hermes/lazy-packages
-
-# v2026.9.21 could leave a named profile's outgoing final reply in that
-# profile's state.db while the shared gateway's boot recovery checked the root
-# ledger. v2026.9.24 fixes new writes but does not replay those old rows. They
-# are an advisory: an operator may accept that a sender must make a new request
-# (which can rerun tools). An unreadable ledger is a different, unknown state;
-# stop rather than claiming the upgrade has checked it.
-delivery_check_rc=0
-python /app/check_pending_deliveries.py --hermes-home /data/.hermes || delivery_check_rc=$?
-if [ "$delivery_check_rc" -eq 2 ]; then
-  echo "[delivery-preflight] WARNING: old named-profile replies may not be replayed; continuing the upgrade as configured" >&2
-elif [ "$delivery_check_rc" -ne 0 ]; then
-  echo "[delivery-preflight] ERROR: could not verify named-profile delivery ledgers; stopping before config migration" >&2
-  exit "$delivery_check_rc"
-fi
-
-# The official Docker hook migrates only its current HERMES_HOME. This image
-# also serves named profiles under the same persistent volume, so migrate the
-# root and every live profile before the dashboard or gateway can read them.
-# The helper rejects symlinked state paths, preserves each profile's own
-# HERMES_HOME, and stops startup if a migration fails after upstream rollback.
-python /app/migrate_hermes_configs.py
+# server.py binds /setup and /health before running prepare_hermes.py under a
+# bounded, visible supervisor. That worker settles interrupted PM publication,
+# refreshes the current image's dependencies and migrates root/named configs
+# before either Hermes child can start.
 
 # Bootstrap OAuth tokens from env var (e.g. xAI Grok SuperGrok).
 # Set HERMES_AUTH_JSON_BOOTSTRAP to the contents of a locally-generated
@@ -106,4 +79,4 @@ rm -f /data/.hermes/gateway.pid /data/.hermes/gateway.lock /data/.hermes/gateway
 # Dashboard has no respawn supervisor every proxied page 503s until redeploy
 # while /setup and /health stay green. Setting it here would skip that pairing.
 
-exec python /app/server.py
+exec /opt/hermes/wrapper-venv/bin/python -E -s /app/server.py

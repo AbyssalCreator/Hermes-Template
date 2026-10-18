@@ -19,13 +19,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
+import hermes_yaml as yaml
 
 
-UPSTREAM_MIGRATOR = Path("/opt/hermes-agent/scripts/docker_config_migrate.py")
+UPSTREAM_MIGRATOR = Path(os.environ.get("HERMES_REPO_ROOT", "/opt/hermes/repo")) / "scripts/docker_config_migrate.py"
 SUPPORT_FLOOR_VERSION = 12  # upstream hermes_cli.config_migrations
 SOUL_REWRITE_VERSION = 41  # upstream _migrate_to_41 touches the entire profile roster
-# Matches hermes_constants.PROFILE_ID_RE in v2026.9.24. Keep in step on bumps.
+# Matches hermes_constants.PROFILE_ID_RE in v0.22.2. Keep in step on bumps.
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
@@ -90,6 +90,59 @@ def _parse_config_bytes(raw: bytes, path: Path) -> tuple[dict | None, int | None
 
 def _parsed_config(path: Path) -> tuple[dict | None, int | None]:
     return _parse_config_bytes(_read_regular(path)[0], path)
+
+
+IMAGE_EXECUTION_ENV_KEYS = (
+    "HERMES_RUNTIME_DIR", "HERMES_PYTHON", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
+)
+
+
+def validate_profile_execution_environment(home: Path) -> None:
+    """Refuse incompatible stored interpreter settings without rewriting the file.
+
+    Native dotenv can reload with override=True after spawn. Restoring the child
+    env alone cannot establish image ownership. This parser only reads dotenv;
+    it does not hydrate external secret sources or execute profile code.
+    """
+    from agent.secret_scope import load_env_file
+
+    path = home / ".env"
+    if not _file_exists_without_following_links(path):
+        return
+    _read_regular(path)  # native load_env_file intentionally treats unreadable as empty
+    values = load_env_file(path)
+    conflicts = [
+        key for key in IMAGE_EXECUTION_ENV_KEYS
+        if values.get(key) not in (None, "") and values[key] != os.environ.get(key)
+    ]
+    if conflicts:
+        raise RuntimeError(
+            f"{path} contains conflicting runtime overrides: {', '.join(conflicts)}. "
+            "The file was preserved. Remove or update these settings to match this "
+            "image using an operator volume edit, then retry preparation."
+        )
+
+
+def profile_environment(home: Path) -> dict[str, str]:
+    """Use the target home's secrets, never a launch profile's inherited keys."""
+    validate_profile_execution_environment(home)
+    from tools.environments.local import served_profile_child_env
+
+    env = served_profile_child_env(
+        base=os.environ, target_home=home, inherit_credentials=True,
+    )
+    for key in IMAGE_EXECUTION_ENV_KEYS:
+        if key in os.environ:
+            env[key] = os.environ[key]
+        else:
+            env.pop(key, None)
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_SUPERVISED_CHILD"] = "1"
+    env["HERMES_NONINTERACTIVE"] = "1"
+    # This legacy target contains Python 3.12 extensions. PM owns the 3.14
+    # dependency environment; retain the old bytes without making them importable.
+    env.pop("HERMES_LAZY_INSTALL_TARGET", None)
+    return env
 
 
 def _target_config_version(migrator: Path) -> int:
@@ -231,8 +284,8 @@ def _directory_if_present(path: Path, *, allow_regular_file: bool = False) -> bo
     raise RuntimeError(f"refusing non-directory Hermes path: {path}")
 
 
-def config_homes(root: Path) -> list[Path]:
-    """Select only real homes with a regular config.yaml.
+def config_homes(root: Path, *, include_env_only: bool = False) -> list[Path]:
+    """Select real config homes, optionally including live dotenv-only homes.
 
     A config file itself is an upstream profile identity marker. A tombstoned
     profile is excluded even if a stale process recreated its directory.
@@ -243,7 +296,9 @@ def config_homes(root: Path) -> list[Path]:
         raise RuntimeError(f"Hermes home does not exist: {root}")
     root = root.resolve(strict=True)
     homes: list[Path] = []
-    if _file_exists_without_following_links(root / "config.yaml"):
+    if _file_exists_without_following_links(root / "config.yaml") or (
+        include_env_only and _file_exists_without_following_links(root / ".env")
+    ):
         _file_exists_without_following_links(root / ".env")
         _directory_if_present(root / "backups")
         _directory_if_present(root / "backups" / "config")
@@ -264,7 +319,9 @@ def config_homes(root: Path) -> list[Path]:
             continue
         if has_deleted and (deleted / name).exists():
             continue
-        if _file_exists_without_following_links(entry / "config.yaml"):
+        if _file_exists_without_following_links(entry / "config.yaml") or (
+            include_env_only and _file_exists_without_following_links(entry / ".env")
+        ):
             _file_exists_without_following_links(entry / ".env")
             _directory_if_present(entry / "backups")
             _directory_if_present(entry / "backups" / "config")
@@ -414,18 +471,18 @@ def migrate(root: Path, migrator: Path = UPSTREAM_MIGRATOR) -> None:
     for job in jobs:
         home, config, stamp = job.home, job.config, job.stamp
         config_path = home / "config.yaml"
-        env = {**os.environ, "HERMES_HOME": str(home)}
-        if stamp == 12:
-            # Hermes' 12→13 migration clears LLM_MODEL as an obsolete CLI env
-            # key. This template still uses it for setup completeness and
-            # gateway startup, including when Railway supplies it without a
-            # .env entry. An explicit empty process value suppresses only that
-            # old cleanup while leaving the rest of the upstream steps intact.
-            env["LLM_MODEL"] = ""
         failure: str | None = None
         try:
-            result = subprocess.run([sys.executable, str(migrator)], env=env, check=False)
-        except OSError as exc:
+            env = profile_environment(home)
+            if stamp == 12:
+                # Suppress only upstream's obsolete LLM_MODEL cleanup; this
+                # template still uses the variable, including Railway values.
+                env["LLM_MODEL"] = ""
+            result = subprocess.run(
+                [os.environ.get("HERMES_PYTHON", sys.executable), "-E", "-s", str(migrator)],
+                env=env, stdout=sys.stderr, check=False,
+            )
+        except Exception as exc:
             failure = f"could not start hook: {exc}"
         if failure is None and result.returncode != 0:
             failure = f"hook exited {result.returncode}"
