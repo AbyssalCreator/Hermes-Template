@@ -6,8 +6,9 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on [Railway]
 
 > Hermes Agent is an autonomous AI agent by [Nous Research](https://nousresearch.com/) that lives on your server, connects to your messaging channels (Telegram, Discord, Slack, etc.), and gets more capable the longer it runs.
 
-<!-- TODO: Add dashboard screenshot -->
-<!-- ![Dashboard](docs/dashboard.png) -->
+## Community deployments
+
+For Dockhold, see the [community template](https://github.com/dockhold/hermes-agent-starter), maintained separately by the Dockhold team.
 
 ## Features
 
