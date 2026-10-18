@@ -1131,6 +1131,18 @@
   <!-- Main panels -->
   <div id="main">
 
+    <div class="hindsight-upgrade-notice" x-show="status.preparation?.state && status.preparation.state !== 'ready'" x-cloak role="status" aria-live="polite" style="margin:20px;">
+      <strong x-text="status.preparation?.state === 'failed' ? 'Hermes preparation needs attention' : 'Preparing Hermes…'"></strong>
+      <p x-text="status.preparation?.message"></p>
+      <p>Chat and configuration changes wait until preparation finishes. Progress is also recorded in the deployment logs.</p>
+      <button class="btn sm" x-show="status.preparation?.state === 'failed' && !status.preparation?.requires_restore" @click="retryPreparation()">Retry preparation</button>
+      <button class="btn sm" x-show="status.preparation?.requires_restore" @click="page='backup'">Open Backup &amp; Restore</button>
+    </div>
+
+    <template x-for="(warning, i) in status.preparation?.warnings || []" :key="i">
+      <div class="hindsight-upgrade-notice" role="note" style="margin:20px;" x-text="warning"></div>
+    </template>
+
     <!-- ── Setup panel ─────────────────────────────── -->
     <div class="panel" :class="{active: page==='setup'}">
       <div class="panel-header">
@@ -1141,7 +1153,12 @@
 
         <div class="hindsight-upgrade-notice" x-show="status.hindsight_configured === true" role="note">
           <strong>Check Hindsight memory after this upgrade</strong>
-          <p>At least one profile uses Hindsight. Hermes v2026.9.24 now loads it from the plugin catalog; this update does not delete your stored memories. Check <a href="/?force=1">Hermes Dashboard</a> &rarr; Memory for each affected profile. If Hindsight is missing, install it from the Hermes plugin catalog for that profile, then test recall and retention.</p>
+          <p>At least one profile uses Hindsight. This update keeps your stored memories and plugin source. Older Hindsight plugins can need an update before setup or dependency repair works. Check <a href="/?force=1">Hermes Dashboard</a> &rarr; Plugins and Memory for each affected profile; review custom plugin changes before updating, then test recall and retention.</p>
+        </div>
+
+        <div class="hindsight-upgrade-notice" x-show="status.email_authserv_missing?.length" x-cloak role="note">
+          <strong>Email needs a receiving-server authentication setting</strong>
+          <p>In <a href="/?force=1">Hermes Dashboard</a> &rarr; Channels &rarr; Email, set <strong>Receiving MTA authserv-id</strong> to the exact value in your receiving server’s topmost Authentication-Results header. Profiles: <span x-text="(status.email_authserv_missing || []).join(', ')"></span>. Until configured, authenticated incoming mail is rejected even if the account connects. After saving, test with a new email.</p>
         </div>
 
         <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:var(--text-dim);">
@@ -1596,6 +1613,20 @@
           <button class="btn success" @click="startGw()"        :disabled="gw.state==='running'">▶ Start</button>
           <button class="btn danger"  @click="stopGw()"         :disabled="gw.state==='stopped'">■ Stop</button>
           <button class="btn"         @click="restartGateway()">↺ Restart</button>
+          <button class="btn"         @click="applyDependencies()">Apply dependencies</button>
+        </div>
+        <p class="hint">Apply dependencies restarts the Hermes dashboard and a running gateway after a plugin asks for a restart. A stopped gateway stays stopped; paused bots stay paused. Open chats briefly reconnect.</p>
+
+        <div class="card" x-show="status.preparation?.integrations?.length" x-cloak>
+          <div class="section-label">Last integration check</div>
+          <template x-for="item in status.preparation?.integrations || []" :key="item.profile + ':' + item.name">
+            <div style="margin-bottom:12px;">
+              <strong x-text="item.profile + ' · ' + item.name"></strong>
+              <p class="hint" x-text="item.message"></p>
+              <p class="hint" x-show="item.retry_command">Retry explicitly in the Hermes Console: <code x-text="item.retry_command"></code></p>
+            </div>
+          </template>
+          <p class="hint">These results were recorded during preparation. After changing plugins or dependencies, check their current status in Hermes Dashboard &rarr; Plugins or Memory. Source presence does not verify service access or stored memories; test the integration before relying on backups of external provider files.</p>
         </div>
 
         <div class="status-split" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
@@ -1716,6 +1747,7 @@
             approved users, chat history, skills, cron jobs, and supported provider files — as a single .zip.
             Hindsight cloud/external memory and embedded PostgreSQL files under /data/.pg0 are not included;
             back up the external service and the full /data volume separately before relying on this zip for a restore.
+            Check selected memory plugins before exporting; an unavailable plugin can leave its provider files out of this ZIP.
             Upload it via Restore below on another deployment to reproduce this bot there.
             <strong style="color:var(--text);">The file is not encrypted</strong> — it contains
             your API keys and bot tokens in plain text, so store it somewhere safe.
@@ -1761,7 +1793,7 @@
           <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0 0 12px;">
             Uploading a backup here <strong style="color:var(--text);">overwrites</strong> this
             deployment's current config, credentials, and data with the backup's contents, then
-            briefly restarts the gateway. Anything changed here since the backup was taken (e.g.
+            prepares the restored settings before restarting Hermes. Anything changed here since the backup was taken (e.g.
             newer user approvals) can be lost. A safety snapshot of the current state is taken
             automatically first — see below if you need to recover it.
           </p>
@@ -1929,6 +1961,27 @@
             template-only fixes and improvements on top of it — the Hermes version never changes within a series.
             <strong style="color:var(--text);">Pick the highest number</strong> for the Hermes version you want; each branch stays put once published.
           </div>
+        </div>
+
+        <div class="changelog-entry major">
+          <div class="changelog-date">October 17, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box"><span class="meta-label">Git branch</span><code>release/v0.22.2/1</code></span>
+            <span class="meta-box version"><span class="meta-label">Hermes compatible version</span><code>v0.22.2</code></span>
+          </div>
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Hermes Agent v2026.9.24 → v0.22.2, with the release’s managed Python and toolchain built into the image.</li>
+            <li>Email accounts using authenticated senders need Receiving MTA authserv-id in the native Channels → Email settings. Setup highlights missing pins; test with a new email after saving.</li>
+            <li>Several integrations now come from Hermes’ plugin catalog. Startup checks selected integrations and shows missing-plugin recovery commands; existing customized plugins are preserved. Older Hindsight plugins may need a reviewed update before setup or repair.</li>
+          </ul>
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li>Setup stays available while dependencies and root/named-profile settings are prepared. Progress, warnings, failures and retry controls are visible; chat starts after preparation completes.</li>
+            <li>Setup saves, provider changes and removal use Hermes’ new config rules while preserving unrelated settings and refusing damaged YAML.</li>
+            <li>Apply dependencies restarts the dashboard and a running gateway without changing configuration. A stopped gateway stays stopped and paused bots stay paused.</li>
+            <li>Restore prepares and migrates the imported root and named profiles before restarting Hermes. Preparation failures leave chat stopped and the safety snapshot available; an interrupted import stays blocked across redeploys until recovered.</li>
+          </ul>
         </div>
 
         <div class="changelog-entry minor">
@@ -2375,6 +2428,7 @@ function app() {
     // True only when the SERVER has a persisted complete config.
     // Distinct from isSetupDone, which tracks the in-memory form.
     savedConfigComplete: false,
+    configNeedsLoad: true,
     // Hermes release this image pins, reported by the server (HERMES_REF).
     // Never hardcoded here — it must stay correct when a deployment is pinned
     // to an older release via the Railway variable.
@@ -2595,13 +2649,15 @@ function app() {
       // setup form — and on the Backup page that looks like the restore blew up.
       ['dragover','drop'].forEach(evt =>
         window.addEventListener(evt, e => { e.preventDefault(); }, false));
-      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadSnapshots(), this.loadBackupJobs()]);
+      // Status polling must start before any initial request can wait on
+      // preparation. Status loads settings when Hermes becomes ready.
       setInterval(() => this.loadStatus(),  5000);
       setInterval(() => this.loadLogs(),    3000);
       setInterval(() => this.loadPairing(), 5000);
       setInterval(() => {
         if (this.page === 'backup' || this.backupJobs.some(j => j.status === 'running')) this.loadBackupJobs();
       }, 3000);
+      await Promise.all([this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadSnapshots(), this.loadBackupJobs()]);
     },
 
     async loadConfig() {
@@ -2610,6 +2666,7 @@ function app() {
         if (r.ok) {
           const d = await r.json();
           this.vars = d.vars || {};
+          this.configNeedsLoad = false;
           // Refresh xAI OAuth status (drives configuredProviders computed getter).
           const xs = await fetch('/setup/api/oauth/xai/status').then(r2 => r2.json()).catch(() => ({ status: 'none' }));
           this.xai.status = xs.status;
@@ -2684,9 +2741,12 @@ function app() {
         const r = await fetch('/setup/api/status');
         if (r.ok) {
           const d = await r.json();
+          const becameReady = d.preparation?.state === 'ready' && this.status.preparation?.state !== 'ready';
+          if (becameReady) this.configNeedsLoad = true;
           this.status = d; this.gw = d.gateway||{};
           this.paused = d.paused || null;
           if (d.hermes_version) this.hermesVersion = d.hermes_version;
+          if (d.preparation?.state === 'ready' && this.configNeedsLoad) await this.loadConfig();
         }
       } catch {}
     },
@@ -2712,9 +2772,22 @@ function app() {
       } catch {}
     },
 
-    async startGw()        { await fetch('/setup/api/gateway/start',   {method:'POST'}); this.notify('Starting…',   true); setTimeout(()=>this.loadStatus(),1000); },
-    async stopGw()         { await fetch('/setup/api/gateway/stop',    {method:'POST'}); this.notify('Stopping…',   true); setTimeout(()=>this.loadStatus(),1000); },
-    async restartGateway() { await fetch('/setup/api/gateway/restart', {method:'POST'}); this.notify('Restarting…', true); setTimeout(()=>this.loadStatus(),2000); },
+    async hermesAction(path, message) {
+      try {
+        const r = await fetch(path, {method: 'POST'});
+        const d = await r.json();
+        this.notify(r.ok ? message : (d.error || 'Action failed'), r.ok);
+      } catch { this.notify('Could not confirm the action. Refresh Status before retrying.', false); }
+      await this.loadStatus();
+    },
+    async startGw()        { await this.hermesAction('/setup/api/gateway/start', 'Gateway start requested'); },
+    async stopGw()         { await this.hermesAction('/setup/api/gateway/stop', 'Gateway stopped'); },
+    async restartGateway() { await this.hermesAction('/setup/api/gateway/restart', 'Gateway restart requested'); },
+    async applyDependencies() {
+      if (!confirm('Restart Hermes processes to apply dependencies? Active replies may be interrupted; open chats briefly reconnect.')) return;
+      await this.hermesAction('/setup/api/dependencies/apply', 'Hermes process reload requested');
+    },
+    async retryPreparation() { await this.hermesAction('/setup/api/preparation/retry', 'Preparation retry started'); },
 
     // Clears hermes' ESTOP sentinel. No gateway restart: hermes re-stats the
     // file on every check, so the next message is served immediately and the
@@ -2854,7 +2927,7 @@ function app() {
 
     async restoreBackup() {
       if (!this.restoreFile) return;
-      if (!confirm('Restore from this backup? This overwrites the current config, credentials, and data on this deployment, and briefly restarts the gateway. A safety snapshot of the current state is taken first.')) return;
+      if (!confirm('Restore from this backup? Hermes stops while current config, credentials, and data are replaced and prepared. A safety snapshot of the current state is taken first.')) return;
       this.restoreBusy = true;
       try {
         const fd = new FormData();
@@ -2862,10 +2935,13 @@ function app() {
         const r = await fetch('/setup/api/backup/restore', { method: 'POST', body: fd });
         const d = await r.json().catch(() => ({}));
         if (r.ok) {
-          this.notify(d.warning ? `Restored, but: ${d.warning}` : 'Restore complete', !d.warning);
+          const result = d.preparing
+            ? 'Archive imported. Hermes is preparing the restored data; watch the preparation status above.'
+            : 'Restore complete — your config and data were replaced and the gateway restarted.';
+          this.notify(d.warning ? `${result} ${d.warning}` : result, !d.warning);
           this.setRestoreResult(d.warning
-            ? { ok: false, warn: true, msg: `Restored, but: ${d.warning}` }
-            : { ok: true, msg: 'Restore complete — your config and data were replaced and the gateway restarted.' });
+            ? { ok: false, warn: true, msg: `${result} ${d.warning}` }
+            : { ok: true, msg: result });
           this.restoreFile = null;
           if (this.$refs.restoreInput) this.$refs.restoreInput.value = '';
           await Promise.all([this.loadConfig(), this.loadStatus(), this.loadSnapshots()]);

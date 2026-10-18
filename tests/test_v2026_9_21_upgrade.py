@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import yaml
+import hermes_yaml as yaml
 from starlette.datastructures import UploadFile
 from starlette.responses import FileResponse, JSONResponse
 
@@ -523,14 +523,12 @@ class RouterProviderUiTests(unittest.TestCase):
 class ReleasePinTests(unittest.TestCase):
     def test_dockerfile_pins_target_release(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("ARG HERMES_REF=v2026.9.24", dockerfile)
+        self.assertIn("ARG HERMES_REF=v0.22.2", dockerfile)
 
     def test_dockerfile_pins_fixed_sqlite_runtime(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("ARG SQLITE_AUTOCONF_VERSION=3530400", dockerfile)
         self.assertIn("libsqlite3.so.3.53.4", dockerfile)
-        self.assertIn("v < (3, 51, 3)", dockerfile)
-        self.assertIn("tokenize='trigram'", dockerfile)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ import secrets
 import shutil
 import signal
 import stat
+import sys
 import tempfile
 import time
 import zipfile
@@ -518,7 +519,7 @@ def _read_config_for_write(path: Path) -> dict:
     panel and xAI OAuth write this same file, so they must reject a bad read
     before changing either config.yaml or its companion .env/auth.json files.
     """
-    import yaml
+    import hermes_yaml as yaml
 
     try:
         mode = path.lstat().st_mode
@@ -542,9 +543,11 @@ def _read_config_for_write(path: Path) -> dict:
 
 def _write_config_atomic(path: Path, data: dict) -> None:
     """Use the pinned Hermes writer for atomic, comment-preserving config saves."""
-    from hermes_cli.config import atomic_config_write
+    from hermes_cli.config import atomic_config_replace
 
-    atomic_config_write(path, data)
+    # This is the complete desired state: model switches and provider removal
+    # deliberately delete stale fields. atomic_config_write now rejects omissions.
+    atomic_config_replace(path, data)
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -716,28 +719,8 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
     merged_terminal["cwd"] = "/tmp"
     merged["terminal"] = merged_terminal
 
-    # Pin the browser backend off, because this image opts into the new one by
-    # ACCIDENT. v2026.8.13 added `browser.backend`, whose default "" means "use
-    # Browser Use mode whenever the browser-use CLI is runnable" — and
-    # _find_cli() (tools/browser_use_cli.py) counts a bare `uvx` as runnable.
-    # Our base image IS ghcr.io/astral-sh/uv, which ships /usr/local/bin/uvx,
-    # so the default silently resolves to Browser Use here (verified in the
-    # built image: is_browser_use_cli_mode() -> True).
-    #
-    # That swaps the whole browser_* surface for a single `browser_exec` tool
-    # (check_fn=is_browser_use_cli_mode, and present in the general/coding/
-    # research toolsets), which shells out to `uvx browser-use` — a PyPI fetch
-    # on first call — and then needs a CDP-reachable Chrome. This image has no
-    # Chromium at all, so that tool can only fail, after burning a turn.
-    # Nothing is lost by pinning: verified on BOTH the v2026.8.3 and v2026.8.13
-    # images that check_browser_requirements() is already False here (no
-    # Chromium), so the built-in browser_* tools are not exposed either way.
-    # This keeps the model's toolbox identical to v2026.8.3 rather than handing
-    # it a tool that cannot work.
-    #
-    # setdefault, not assignment — "off" is upstream's documented opt-out, and
-    # someone who deliberately picks Browser Use in hermes' own settings (or
-    # `/browser use on`) should keep it. Revisit if Chromium is ever baked in.
+    # This image has no browser runtime. Keep upstream's explicit opt-out as
+    # the default; preserve a backend the operator configured in Hermes.
     merged_browser = dict(merged.get("browser") if isinstance(merged.get("browser"), dict) else {})
     merged_browser.setdefault("backend", "off")
     merged["browser"] = merged_browser
@@ -949,8 +932,17 @@ def build_hermes_env() -> dict[str, str]:
     saved later through the setup wizard, since those only ever land in
     HERMES_HOME/.env, not in our own os.environ.
     """
+    from migrate_hermes_configs import IMAGE_EXECUTION_ENV_KEYS, validate_profile_execution_environment
+
+    validate_profile_execution_environment(Path(HERMES_HOME))
     env = {**os.environ, "HERMES_HOME": HERMES_HOME}
     env.update(read_env(ENV_FILE))
+    for key in IMAGE_EXECUTION_ENV_KEYS:
+        if key in os.environ:
+            env[key] = os.environ[key]
+        else:
+            env.pop(key, None)
+    env.pop("HERMES_LAZY_INSTALL_TARGET", None)
     # Retire hermes' own respawn-storm breaker (new in v2026.7.20,
     # hermes_cli/gateway.py `run_gateway`): once >5 starts land in a rolling
     # 120s window it BLOCKS with time.sleep() before the gateway boots, counted
@@ -1294,22 +1286,18 @@ async def _poll_xai_device_auth(state: dict) -> None:
                 state["error"] = "Invalid token response from xAI"
                 return
             try:
-                # An invalid existing config must not be replaced after we have
-                # already changed auth.json or .env for the new credential.
-                async with cfg_lock:
-                    # A newer auth attempt or Disconnect supersedes this poll.
-                    # Check under the same lock used by credential writes.
-                    if state is not _xai_oauth_state:
-                        return
-                    _save_xai_oauth_bundle(tokens, state.get("model", ""))
-                    state["status"] = "authorized"
+                async with lifecycle_lock:
+                    async with cfg_lock:
+                        if state is not _xai_oauth_state or preparation["state"] != "ready":
+                            return
+                        _save_xai_oauth_bundle(tokens, state.get("model", ""))
+                        state["status"] = "authorized"
+                    await gw.restart()
+                    await dash.restart()
             except Exception as exc:
                 state["status"] = "error"
                 state["error"] = f"Could not save xAI authentication: {exc}"
                 print(f"[xai-oauth] save failed: {exc!r}", flush=True)
-                return
-            print("[xai-oauth] authorized — restarting gateway", flush=True)
-            asyncio.create_task(gw.restart())
             return
 
         try:
@@ -1337,7 +1325,8 @@ async def api_oauth_xai_delete(request: Request) -> Response:
     if err := guard(request):
         return err
     auth_path = Path(HERMES_HOME) / "auth.json"
-    async with cfg_lock:
+    async with lifecycle_lock, cfg_lock:
+        if err := guard(request): return err
         try:
             auth_before = _file_snapshot(auth_path)
             _file_snapshot(ENV_FILE)  # refuse a linked or non-regular env file
@@ -1420,7 +1409,8 @@ async def api_oauth_xai_start(request: Request) -> Response:
         "status": "pending",
         "model": model,
     }
-    async with cfg_lock:
+    async with lifecycle_lock, cfg_lock:
+        if err := guard(request): return err
         _xai_oauth_state = state
     asyncio.create_task(_poll_xai_device_auth(state))
 
@@ -1538,6 +1528,16 @@ def guard(request: Request) -> Response | None:
     - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
     """
     if _is_authenticated(request):
+        recovery_restore = (
+            request.url.path == "/setup/api/backup/restore"
+            and preparation["state"] == "failed"
+            and (_preparation_task is None or _preparation_task.done())
+        )
+        if (getattr(request, "method", "GET") not in {"GET", "HEAD", "OPTIONS"}
+                and preparation["state"] != "ready" and not recovery_restore
+                and request.url.path != "/setup/api/preparation/retry"):
+            return JSONResponse({"error": "Hermes preparation must finish before making changes. See Setup for progress.",
+                                 "preparation": preparation["state"]}, status_code=503)
         return None
     accept = request.headers.get("accept", "").lower()
     wants_html = "text/html" in accept
@@ -1721,9 +1721,9 @@ class Gateway:
         self._last_exit_at: float | None = None
         self._started_monotonic: float | None = None
 
-    async def start(self, *, reset_budget: bool = True):
+    async def start(self, *, reset_budget: bool = True, write_config: bool = True):
         if self.proc and self.proc.returncode is None:
-            return
+            return True
         # A manual Start/Restart (or boot) grants a fresh crash-loop budget; the
         # auto-respawn path passes reset_budget=False so repeated crashes keep
         # accumulating toward the give-up threshold.
@@ -1739,8 +1739,9 @@ class Gateway:
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            async with cfg_lock:
-                write_config_yaml(read_env(ENV_FILE))
+            if write_config:
+                async with cfg_lock:
+                    write_config_yaml(read_env(ENV_FILE))
             # --replace: force-displace any existing gateway.pid lock holder
             # before claiming it. Without this, a lock left behind by a prior
             # incarnation this supervisor doesn't recognize as "our" dead
@@ -1774,9 +1775,11 @@ class Gateway:
             self.started_at = time.time()
             self._started_monotonic = time.monotonic()
             asyncio.create_task(self._drain(self.proc))
+            return True
         except Exception as e:
             self.state = "error"
             self.logs.append(f"[error] Failed to start: {e}")
+            return False
 
     async def stop(self):
         self._stopping = True
@@ -1819,7 +1822,7 @@ class Gateway:
     async def restart(self):
         await self.stop()
         self.restarts += 1
-        await self.start()
+        return await self.start()
 
     async def _drain(self, proc: asyncio.subprocess.Process):
         assert proc.stdout
@@ -1967,6 +1970,94 @@ class Gateway:
 
 gw = Gateway()
 cfg_lock = asyncio.Lock()
+lifecycle_lock = asyncio.Lock()
+
+# The admin server binds before volume preparation. Network-bound PM work must
+# not consume Railway's pre-bind health deadline or leave users without progress.
+preparation = {"state": "ready", "phase": "idle", "message": "", "warnings": [], "integrations": []}
+_preparation_task: asyncio.Task | None = None
+_preparation_mode = "startup"
+PREPARATION_TIMEOUT = 900
+
+
+async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Stop an owned command and any acquisition workers it launched."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+    # The immediate process may have exited before its children did.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+async def _prepare_hermes(mode: str) -> bool:
+    global _preparation_mode
+    _preparation_mode = mode
+    preparation.update(state="running", phase="starting", message="Preparing Hermes data and dependencies…",
+                       warnings=[], integrations=[], requires_restore=False)
+    proc = None
+    readers = []
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            os.environ.get("HERMES_PYTHON", sys.executable),
+            "-E", "-s", str(Path(__file__).with_name("prepare_hermes.py")), "--mode", mode,
+            env={**os.environ, "HERMES_HOME": HERMES_HOME},
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        async def drain(stream, *, events=False):
+            async for raw in stream:
+                line = raw.decode(errors="replace").rstrip()
+                print(f"[preparation] {line}", flush=True)
+                if not events:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                for key in ("phase", "message", "integrations", "warnings"):
+                    if key in event:
+                        preparation[key] = event[key]
+                if event.get("warning"):
+                    preparation["warnings"] = [*preparation["warnings"][-19:], str(event.get("message", event["warning"]))]
+
+        readers = [asyncio.create_task(drain(proc.stdout, events=True)),
+                   asyncio.create_task(drain(proc.stderr))]
+        await asyncio.wait_for(asyncio.gather(proc.wait(), *readers), timeout=PREPARATION_TIMEOUT)
+        if proc.returncode:
+            raise RuntimeError(f"Preparation exited {proc.returncode}. Check the deployment logs before retrying.")
+        preparation.update(state="ready", phase="complete", message="Hermes preparation complete.")
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        message = (f"Preparation exceeded {PREPARATION_TIMEOUT} seconds. Check deployment logs and retry."
+                   if isinstance(exc, asyncio.TimeoutError) else str(exc))
+        preparation.update(state="failed", phase="failed", message=message)
+        print(f"[preparation] ERROR: {message}", flush=True)
+        return False
+    finally:
+        # Includes PM workers/git children: an orphan must not publish later
+        # while an operator retries or restores this volume.
+        if proc is not None:
+            await _terminate_process_group(proc)
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
 
 
 # ── Hermes dashboard subprocess ───────────────────────────────────────────────
@@ -1997,10 +2088,11 @@ class Dashboard:
         self.proc: asyncio.subprocess.Process | None = None
         self.logs: deque[str] = deque(maxlen=300)
         self._drain_task: asyncio.Task | None = None
+        self._maintenance_stopped = False
 
     async def start(self):
         if self.proc and self.proc.returncode is None:
-            return
+            return True
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 "hermes", "dashboard",
@@ -2023,6 +2115,7 @@ class Dashboard:
                 stderr=asyncio.subprocess.STDOUT,
                 env=build_dashboard_env(),
             )
+            self._maintenance_stopped = False
             print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
             # One line describing the auth shape this dashboard was started
             # with. Nearly every dashboard-side problem in this template comes
@@ -2039,8 +2132,10 @@ class Dashboard:
                       "builds MCP OAuth redirects from the loopback address and those "
                       "sign-ins will not complete", flush=True)
             self._drain_task = asyncio.create_task(self._drain())
+            return True
         except Exception as e:
             print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
+            return False
 
     async def _drain(self):
         """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
@@ -2061,7 +2156,7 @@ class Dashboard:
 
     async def stop(self):
         if not self.proc or self.proc.returncode is not None:
-            return
+            return False
         self.proc.terminate()
         try:
             # v2026.9.21 joins its non-daemon state.db reconciliation worker on
@@ -2074,6 +2169,7 @@ class Dashboard:
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
+        return True
 
     async def restart(self):
         """Respawn so a freshly-saved provider key reaches the embedded Chat tab.
@@ -2083,8 +2179,12 @@ class Dashboard:
         reconnects) — an acceptable trade-off since the alternative is Chat
         staying broken until a full redeploy.
         """
+        _, error = await _gateway_maintenance_check()
+        if error is not None:
+            print(f"[dashboard] restart deferred: {error.body.decode(errors='replace')}", flush=True)
+            return False
         await self.stop()
-        await self.start()
+        return await self.start()
 
 
 dash = Dashboard()
@@ -2190,8 +2290,7 @@ async def set_active_model_via_hermes(
         """One attempt, authenticated for whichever mode the dashboard is in.
 
         The token header authenticates an ungated dashboard, the session cookies
-        a gated one. This is the only dashboard call that does not go through
-        route_proxy(), so it carries its own credentials.
+        a gated one. This template-to-dashboard call carries its own credentials.
         """
         headers = {_SESSION_TOKEN_HEADER: session_token} if session_token else {}
         if session:
@@ -2242,12 +2341,16 @@ async def page_index(request: Request):
 
 
 async def route_health(request: Request):
-    return JSONResponse({"status": "ok", "gateway": gw.state})
+    return JSONResponse({"status": "ok", "gateway": gw.state, "preparation": preparation["state"]})
 
 
 async def api_config_get(request: Request):
     if err := guard(request): return err
+    if preparation["state"] != "ready":
+        return JSONResponse({"error": "Hermes is preparing. Settings will load when it finishes."}, status_code=503)
     async with cfg_lock:
+        if preparation["state"] != "ready":
+            return JSONResponse({"error": "Hermes is preparing. Settings will load when it finishes."}, status_code=503)
         data = read_env(ENV_FILE)
     defs = [{"key": k, "label": l, "category": c, "secret": s} for k, l, c, s in ENV_VARS]
     return JSONResponse({"vars": mask(data), "defs": defs})
@@ -2255,118 +2358,122 @@ async def api_config_get(request: Request):
 
 async def api_config_put(request: Request):
     if err := guard(request): return err
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    try:
-        restart = body.pop("_restart", False)
-        # Set by the setup wizard to the ENV_VARS key of whichever provider's
-        # dropdown entry was selected in this save action (e.g. "NVIDIA_API_KEY")
-        # — empty when the user saved without touching a provider (e.g. just
-        # toggling a messaging channel). See set_active_model_via_hermes().
-        active_provider_key = str(body.pop("_active_provider_key", "") or "").strip()
-        new_vars = body.get("vars", {})
-        async with cfg_lock:
-            config_path = Path(HERMES_HOME) / "config.yaml"
-            current_cfg = _read_config_for_write(config_path)
-            existing = read_env(ENV_FILE)
-            merged = unmask(new_vars, existing)
-            for k, v in existing.items():
-                if k not in merged:
-                    merged[k] = v
-            # Removing the router that currently owns model.provider must not
-            # leave a dangling provider id + model behind. That state looks
-            # configured to the supervisor but can never resolve at runtime.
-            # Clear only the shared active model; other saved providers and
-            # their per-provider model hints remain available for the next pick.
-            reset_removed_router_model = False
-            removed_router_ids = {
-                spec["provider_id"]
-                for key, spec in MANAGED_ROUTER_PROVIDERS.items()
-                if _router_provider_is_configured(existing, key)
-                and not _router_provider_is_configured(merged, key)
-            }
-            if removed_router_ids:
-                current_model = current_cfg.get("model", {})
-                current_id = str(current_model.get("provider") or "").strip().lower() if isinstance(current_model, dict) else ""
-                reset_removed_router_model = any(
-                    current_id in {provider_id, f"custom:{provider_id}"}
-                    for provider_id in removed_router_ids
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        try:
+            restart = body.pop("_restart", False)
+            # Set by the setup wizard to the ENV_VARS key of whichever provider's
+            # dropdown entry was selected in this save action (e.g. "NVIDIA_API_KEY")
+            # — empty when the user saved without touching a provider (e.g. just
+            # toggling a messaging channel). See set_active_model_via_hermes().
+            active_provider_key = str(body.pop("_active_provider_key", "") or "").strip()
+            new_vars = body.get("vars", {})
+            async with cfg_lock:
+                config_path = Path(HERMES_HOME) / "config.yaml"
+                current_cfg = _read_config_for_write(config_path)
+                existing = read_env(ENV_FILE)
+                merged = unmask(new_vars, existing)
+                for k, v in existing.items():
+                    if k not in merged:
+                        merged[k] = v
+                # Removing the router that currently owns model.provider must not
+                # leave a dangling provider id + model behind. That state looks
+                # configured to the supervisor but can never resolve at runtime.
+                # Clear only the shared active model; other saved providers and
+                # their per-provider model hints remain available for the next pick.
+                reset_removed_router_model = False
+                removed_router_ids = {
+                    spec["provider_id"]
+                    for key, spec in MANAGED_ROUTER_PROVIDERS.items()
+                    if _router_provider_is_configured(existing, key)
+                    and not _router_provider_is_configured(merged, key)
+                }
+                if removed_router_ids:
+                    current_model = current_cfg.get("model", {})
+                    current_id = str(current_model.get("provider") or "").strip().lower() if isinstance(current_model, dict) else ""
+                    reset_removed_router_model = any(
+                        current_id in {provider_id, f"custom:{provider_id}"}
+                        for provider_id in removed_router_ids
+                    )
+                if reset_removed_router_model:
+                    merged["LLM_MODEL"] = ""
+                router_spec = MANAGED_ROUTER_PROVIDERS.get(active_provider_key)
+                if router_spec:
+                    if not merged.get(active_provider_key, "").strip():
+                        return JSONResponse(
+                            {"error": f"{router_spec['name']} endpoint API key is required."},
+                            status_code=400,
+                        )
+                    router_base_url = _router_base_url(merged, active_provider_key)
+                    if not router_base_url:
+                        return JSONResponse(
+                            {"error": f"{router_spec['name']} base URL is required."},
+                            status_code=400,
+                        )
+                    if url_error := _router_base_url_error(router_base_url):
+                        return JSONResponse(
+                            {"error": f"{router_spec['name']}: {url_error}"},
+                            status_code=400,
+                        )
+                previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
+                write_env(ENV_FILE, merged)
+                try:
+                    write_config_yaml(merged, reset_model=reset_removed_router_model)
+                except Exception:
+                    # Config and .env are separate files. If the guarded config
+                    # write refuses or fails, restore the exact prior credentials
+                    # rather than leaving the next boot with a half-saved setup.
+                    if previous_env is None:
+                        ENV_FILE.unlink(missing_ok=True)
+                    else:
+                        _atomic_write_text(ENV_FILE, previous_env)
+                    raise
+
+            model_warning = None
+            hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
+            model_value = merged.get("LLM_MODEL", "").strip()
+            if hermes_provider_id and model_value:
+                pin_base_url = ""
+                pin_api_key = ""
+                if hermes_provider_id == "custom":
+                    pin_base_url = (
+                        CUSTOM_STYLE_BASE_URLS.get(active_provider_key)
+                        or merged.get("CUSTOM_PROVIDER_BASE_URL", "").strip()
+                    )
+                    pin_api_key = merged.get(active_provider_key, "").strip()
+                model_warning = await set_active_model_via_hermes(
+                    hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
                 )
-            if reset_removed_router_model:
-                merged["LLM_MODEL"] = ""
-            router_spec = MANAGED_ROUTER_PROVIDERS.get(active_provider_key)
-            if router_spec:
-                if not merged.get(active_provider_key, "").strip():
-                    return JSONResponse(
-                        {"error": f"{router_spec['name']} endpoint API key is required."},
-                        status_code=400,
-                    )
-                router_base_url = _router_base_url(merged, active_provider_key)
-                if not router_base_url:
-                    return JSONResponse(
-                        {"error": f"{router_spec['name']} base URL is required."},
-                        status_code=400,
-                    )
-                if url_error := _router_base_url_error(router_base_url):
-                    return JSONResponse(
-                        {"error": f"{router_spec['name']}: {url_error}"},
-                        status_code=400,
-                    )
-            previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
-            write_env(ENV_FILE, merged)
-            try:
-                write_config_yaml(merged, reset_model=reset_removed_router_model)
-            except Exception:
-                # Config and .env are separate files. If the guarded config
-                # write refuses or fails, restore the exact prior credentials
-                # rather than leaving the next boot with a half-saved setup.
-                if previous_env is None:
-                    ENV_FILE.unlink(missing_ok=True)
+                # Log the outcome either way. A failed pin is a SILENT downgrade —
+                # hermes falls back to provider auto-resolution, which works for a
+                # single-provider setup and fails opaquely for custom endpoints
+                # (their base_url/api_key are only written by this pin). The reason
+                # otherwise only exists in the HTTP response body, which nobody sees.
+                if model_warning:
+                    print(f"[config] provider pin FAILED — provider={hermes_provider_id} "
+                          f"model={model_value!r}: {model_warning}", flush=True)
                 else:
-                    _atomic_write_text(ENV_FILE, previous_env)
-                raise
+                    print(f"[config] provider pin ok — provider={hermes_provider_id} "
+                          f"model={model_value!r}", flush=True)
 
-        model_warning = None
-        hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
-        model_value = merged.get("LLM_MODEL", "").strip()
-        if hermes_provider_id and model_value:
-            pin_base_url = ""
-            pin_api_key = ""
-            if hermes_provider_id == "custom":
-                pin_base_url = (
-                    CUSTOM_STYLE_BASE_URLS.get(active_provider_key)
-                    or merged.get("CUSTOM_PROVIDER_BASE_URL", "").strip()
-                )
-                pin_api_key = merged.get(active_provider_key, "").strip()
-            model_warning = await set_active_model_via_hermes(
-                hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
-            )
-            # Log the outcome either way. A failed pin is a SILENT downgrade —
-            # hermes falls back to provider auto-resolution, which works for a
-            # single-provider setup and fails opaquely for custom endpoints
-            # (their base_url/api_key are only written by this pin). The reason
-            # otherwise only exists in the HTTP response body, which nobody sees.
+            if restart:
+                gateway_started = await gw.restart()
+                # The dashboard (and its embedded Chat tab) only ever sees the env
+                # it was spawned with — a newly-saved provider key doesn't reach
+                # the already-running process otherwise. See Dashboard.restart().
+                dashboard_started = await dash.restart()
+                if gateway_started is False or dashboard_started is False:
+                    model_warning = (model_warning + " " if model_warning else "") + "Settings saved, but Hermes could not restart. Check Logs and deployment logs."
+            resp = {"ok": True, "restarting": restart}
             if model_warning:
-                print(f"[config] provider pin FAILED — provider={hermes_provider_id} "
-                      f"model={model_value!r}: {model_warning}", flush=True)
-            else:
-                print(f"[config] provider pin ok — provider={hermes_provider_id} "
-                      f"model={model_value!r}", flush=True)
-
-        if restart:
-            asyncio.create_task(gw.restart())
-            # The dashboard (and its embedded Chat tab) only ever sees the env
-            # it was spawned with — a newly-saved provider key doesn't reach
-            # the already-running process otherwise. See Dashboard.restart().
-            asyncio.create_task(dash.restart())
-        resp = {"ok": True, "restarting": restart}
-        if model_warning:
-            resp["warning"] = model_warning
-        return JSONResponse(resp)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+                resp["warning"] = model_warning
+            return JSONResponse(resp)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _dashboard_storage_status() -> dict[str, str]:
@@ -2398,13 +2505,8 @@ async def _dashboard_storage_status() -> dict[str, str]:
     return result
 
 
-def _hindsight_configured() -> bool:
-    """Flag existing Hindsight selections for a targeted upgrade notice.
-
-    The setup panel is the root home's UI, but a shared gateway can serve
-    named profiles. Inspect their live config files too, without following
-    links or letting a damaged profile break the Status page.
-    """
+def _profile_config_paths() -> list[Path]:
+    """Read-only roster for upgrade notices; never follow profile links."""
     root = Path(HERMES_HOME)
     configs = [root / "config.yaml"]
     profiles = root / "profiles"
@@ -2423,7 +2525,11 @@ def _hindsight_configured() -> bool:
                 configs.append(entry / "config.yaml")
     except OSError:
         pass  # Informational notice only; Status remains available.
-    for path in configs:
+    return configs
+
+
+def _hindsight_configured() -> bool:
+    for path in _profile_config_paths():
         try:
             cfg = _read_config_for_write(path)
         except (OSError, ValueError):
@@ -2432,6 +2538,34 @@ def _hindsight_configured() -> bool:
         if isinstance(memory, dict) and str(memory.get("provider") or "").strip().lower() == "hindsight":
             return True
     return False
+
+
+def _email_authserv_missing() -> list[str]:
+    from gateway.config import PlatformConfig
+    from gateway.config_loader import merge_platform_sections
+
+    profiles = []
+    for path in _profile_config_paths():
+        try:
+            cfg = _read_config_for_write(path)
+            env = read_env(path.with_name(".env"))
+            legacy = _file_snapshot(path.with_name("gateway.json"))
+            base = json.loads(legacy[0].decode("utf-8-sig")) if legacy else {}
+            if not isinstance(base, dict):
+                base = {}
+            platforms = merge_platform_sections(cfg, cfg.get("gateway"), base, also=frozenset({"email"}))
+            email = PlatformConfig.from_dict(platforms.get("email", {})).extra
+        except (OSError, ValueError):
+            continue
+        if path.parent == Path(HERMES_HOME):
+            env = {**os.environ, **env}
+        enabled = env.get("EMAIL_ADDRESS") or email.get("address")
+        required = email.get("require_authenticated_sender")
+        if required is None:
+            required = str(env.get("EMAIL_TRUST_FROM_HEADER", "")).lower() not in {"1", "true", "yes", "on"}
+        if enabled and required and not str(email.get("authserv_id") or env.get("EMAIL_AUTHSERV_ID", "")).strip():
+            profiles.append("default" if path.parent == Path(HERMES_HOME) else path.parent.name)
+    return profiles
 
 
 async def api_status(request: Request):
@@ -2454,7 +2588,9 @@ async def api_status(request: Request):
     return JSONResponse({"gateway": gw.status(), "providers": providers,
                          "channels": channels, "hermes_version": HERMES_VERSION,
                          "storage": storage,
+                         "preparation": preparation,
                          "hindsight_configured": _hindsight_configured(),
+                         "email_authserv_missing": _email_authserv_missing(),
                          # None when running; a dict (possibly with null fields)
                          # when hermes' ESTOP sentinel is engaged — see
                          # estop_state() for why a green panel would otherwise
@@ -2493,39 +2629,193 @@ async def api_logs(request: Request):
 
 async def api_gw_start(request: Request):
     if err := guard(request): return err
-    asyncio.create_task(gw.start())
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        if await gw.start() is False:
+            return JSONResponse({"error": "Hermes could not start. Check Logs."}, status_code=503)
     return JSONResponse({"ok": True})
 
 
 async def api_gw_stop(request: Request):
     if err := guard(request): return err
-    asyncio.create_task(gw.stop())
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        _, error = await _gateway_maintenance_check()
+        if error is not None:
+            return error
+        try:
+            await _stop_gateway_for_maintenance()
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
     return JSONResponse({"ok": True})
 
 
 async def api_gw_restart(request: Request):
     if err := guard(request): return err
-    asyncio.create_task(gw.restart())
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        if await gw.restart() is False:
+            return JSONResponse({"error": "Hermes could not start. Check Logs."}, status_code=503)
     return JSONResponse({"ok": True})
+
+
+NATIVE_GATEWAY_ACTIONS = ("gateway-start", "gateway-stop", "gateway-restart", "gateway-migrate")
+NATIVE_GATEWAY_LIFECYCLE_PATHS = frozenset({
+    "/api/gateway/start", "/api/gateway/stop", "/api/gateway/restart",
+    "/api/gateway/migrate", "/api/gateway/drain", "/api/webhooks/enable",
+})
+NATIVE_GATEWAY_ONBOARDING_PATH = re.compile(r"/api/messaging/(?:telegram|whatsapp)/onboarding/[^/]+/apply")
+GATEWAY_STOP_TIMEOUT = 70.0
+
+
+def _verified_root_gateway_pid() -> int | None:
+    """Read native live-process identity; ambiguity is never an absent gateway."""
+    from gateway.status import get_running_pid, get_running_pid_identity_strict
+
+    path = Path(HERMES_HOME) / "gateway.pid"
+    identity = get_running_pid_identity_strict(path)
+    scoped_pid = get_running_pid(path, cleanup_stale=False)
+    if (identity[0] if identity is not None else None) != scoped_pid:
+        raise RuntimeError("Gateway identity or home could not be verified. Check deployment logs before retrying.")
+    return scoped_pid
+
+
+async def _native_gateway_action_busy(gateway_pid: int | None) -> str | None:
+    """Check the native action registry before stopping its Dashboard owner."""
+    if dash.proc is None:
+        # This container has never started a Dashboard, including recovery from
+        # an interrupted restore after a container restart: no native action ran.
+        return None
+    if dash.proc.returncode is not None:
+        if dash._maintenance_stopped and gateway_pid is None:
+            return None
+        raise RuntimeError("Dashboard exited; native gateway actions cannot be checked. Redeploy before retrying maintenance.")
+    client = get_http_client()
+    token = await _get_hermes_session_token()
+
+    async def fetch(name: str, session: dict[str, str]) -> httpx.Response:
+        headers = {_SESSION_TOKEN_HEADER: token} if token else {}
+        if session:
+            headers["cookie"] = "; ".join(f"{key}={value}" for key, value in session.items())
+        return await client.get(
+            f"{HERMES_DASHBOARD_URL}/api/actions/{name}/status?lines=1",
+            headers=headers, timeout=httpx.Timeout(3.0, connect=0.5),
+        )
+
+    for name in NATIVE_GATEWAY_ACTIONS:
+        generation, session = hermes_session.snapshot()
+        response = await fetch(name, session)
+        if _needs_dashboard_login(response.status_code, response.headers.get("location", "")):
+            if await hermes_session.refresh(generation):
+                _, session = hermes_session.snapshot()
+                response = await fetch(name, session)
+        if response.status_code != 200:
+            raise RuntimeError("Could not verify native gateway actions. Wait for Dashboard to recover before retrying.")
+        payload = response.json()
+        if (not isinstance(payload, dict) or payload.get("name") != name
+                or not isinstance(payload.get("running"), bool)):
+            raise RuntimeError("Native gateway action status is invalid; maintenance was not started.")
+        if payload["running"]:
+            # The manual restart fallback becomes the gateway itself. Its
+            # action stays running forever; its verified PID is safe to stop.
+            if name == "gateway-restart" and gateway_pid is not None and payload.get("pid") == gateway_pid:
+                continue
+            return name
+    return None
+
+
+async def _gateway_maintenance_check() -> tuple[int | None, Response | None]:
+    """Called under lifecycle_lock, before stopping either child or importing."""
+    try:
+        pid = await asyncio.to_thread(_verified_root_gateway_pid)
+        action = await _native_gateway_action_busy(pid)
+    except (ImportError, OSError, RuntimeError, ValueError, httpx.RequestError) as exc:
+        return None, JSONResponse({"error": str(exc)}, status_code=503)
+    if action:
+        return pid, JSONResponse({"error": f"Native {action} is still running. Wait for it to finish before retrying."}, status_code=409)
+    return pid, None
+
+
+async def _stop_gateway_for_maintenance(*, dashboard_stopped: bool = False) -> None:
+    """Stop owned and native-detached root gateways, then prove safe absence."""
+    deadline = time.monotonic() + GATEWAY_STOP_TIMEOUT
+    await gw.stop()
+    pid = await asyncio.to_thread(_verified_root_gateway_pid)
+    if pid is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Gateway did not stop within its graceful shutdown limit. No restore or reload was started.")
+        rc, _ = await _run_hermes_cli("gateway", "stop", timeout=remaining)
+        if rc != 0:
+            raise RuntimeError("Native gateway stop failed. No restore or reload was started; check deployment logs.")
+    # The native stop command may return after ten seconds while the gateway
+    # continues draining. Exit zero alone is not authority to overwrite data.
+    while await asyncio.to_thread(_verified_root_gateway_pid) is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Gateway is still draining. No restore or reload was started; retry once it stops.")
+        await asyncio.sleep(min(0.2, remaining))
+    if dashboard_stopped:
+        dash._maintenance_stopped = True
+
+
+async def api_dependencies_apply(request: Request):
+    """Load the selected PM environment without rewriting user configuration."""
+    if err := guard(request): return err
+    if backup_lock.locked():
+        return JSONResponse({"error": "Wait for the backup or restore to finish."}, status_code=409)
+    async with backup_lock, lifecycle_lock:
+        if err := guard(request): return err
+        pid, error = await _gateway_maintenance_check()
+        if error is not None:
+            return error
+        was_running = (gw.state == "starting" or (gw.proc is not None and gw.proc.returncode is None)
+                       or pid is not None)
+        dashboard_stopped = await dash.stop()
+        try:
+            await _stop_gateway_for_maintenance(dashboard_stopped=dashboard_stopped)
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            await dash.start()
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        if await dash.start() is False:
+            return JSONResponse({"error": "Dashboard could not restart. Check deployment logs."}, status_code=503)
+        if was_running:
+            if await gw.start(write_config=False) is False:
+                return JSONResponse({"error": "Gateway could not restart. Check Logs."}, status_code=503)
+    return JSONResponse({"ok": True})
+
+
+async def api_preparation_retry(request: Request):
+    if err := guard(request): return err
+    global _preparation_task
+    if preparation.get("requires_restore"):
+        return JSONResponse({"error": "Restore did not finish. Restore the pre-restore safety snapshot before starting Hermes."}, status_code=409)
+    if preparation["state"] != "failed" or (_preparation_task and not _preparation_task.done()):
+        return JSONResponse({"error": "Preparation is not waiting for a retry."}, status_code=409)
+    preparation.update(state="running", phase="starting", message="Retrying Hermes preparation…")
+    _preparation_task = asyncio.create_task(_initialize_hermes(_preparation_mode))
+    return JSONResponse({"ok": True}, status_code=202)
 
 
 async def api_config_reset(request: Request):
     if err := guard(request): return err
-    try:
-        async with cfg_lock:
-            _read_config_for_write(Path(HERMES_HOME) / "config.yaml")
-            previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
-            ENV_FILE.unlink(missing_ok=True)
-            try:
-                write_config_yaml({}, reset_model=True)
-            except Exception:
-                if previous_env is not None:
-                    _atomic_write_text(ENV_FILE, previous_env)
-                raise
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
-    asyncio.create_task(gw.stop())
-    return JSONResponse({"ok": True})
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        try:
+            async with cfg_lock:
+                _read_config_for_write(Path(HERMES_HOME) / "config.yaml")
+                previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
+                ENV_FILE.unlink(missing_ok=True)
+                try:
+                    write_config_yaml({}, reset_model=True)
+                except Exception:
+                    if previous_env is not None:
+                        _atomic_write_text(ENV_FILE, previous_env)
+                    raise
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        await gw.stop()
+        return JSONResponse({"ok": True})
 
 
 # ── Pairing ───────────────────────────────────────────────────────────────────
@@ -2550,7 +2840,7 @@ def _pjson(path: Path) -> dict:
 def _read_pairing_json(path: Path) -> dict:
     """Read a pairing object for a write; preserve malformed files for recovery."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return {}
     except (json.JSONDecodeError, UnicodeError) as e:
@@ -2598,6 +2888,7 @@ async def api_pairing_approve(request: Request):
     if err := guard(request): return err
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if err := guard(request): return err
     platform, code = body.get("platform",""), body.get("code","").strip()
     if not platform or not code:
         return JSONResponse({"error": "platform and code required"}, status_code=400)
@@ -2633,6 +2924,7 @@ async def api_pairing_deny(request: Request):
     if err := guard(request): return err
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if err := guard(request): return err
     platform, code = body.get("platform",""), body.get("code","").strip()
     p = pairing_dir() / f"{platform}-pending.json"
     try:
@@ -2769,6 +3061,7 @@ async def api_pairing_revoke(request: Request):
     if err := guard(request): return err
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if err := guard(request): return err
     platform, uid = body.get("platform",""), body.get("user_id","")
     if not platform or not uid:
         return JSONResponse({"error": "platform and user_id required"}, status_code=400)
@@ -3019,15 +3312,18 @@ async def _run_hermes_cli(*args: str, timeout: float = BACKUP_SUBPROCESS_TIMEOUT
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=build_hermes_env(),
+            start_new_session=True,
         )
     except OSError as e:
         return 127, f"Could not launch hermes {' '.join(args)}: {e}"
     try:
         raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _terminate_process_group(proc)
         return 124, f"hermes {' '.join(args)} timed out after {timeout}s"
+    except BaseException:
+        await _terminate_process_group(proc)
+        raise
     return proc.returncode, raw.decode(errors="replace")
 
 
@@ -3040,9 +3336,39 @@ async def _hermes_version() -> str:
         return "unknown"
 
 
-def _prune_pre_restore_snapshots() -> None:
+RESTORE_STATE_NAME = "template-restore-state.json"
+
+
+def _restore_state() -> dict | None:
+    snapshot = _file_snapshot(BACKUP_DIR / RESTORE_STATE_NAME)
+    if snapshot is None:
+        return None
+    state = json.loads(snapshot[0].decode("utf-8"))
+    if (not isinstance(state, dict) or state.get("phase") not in {"importing", "imported"}
+            or not isinstance(state.get("snapshot"), str) or not SNAPSHOT_NAME_RE.fullmatch(state["snapshot"])):
+        raise ValueError("Invalid restore recovery record. Keep the safety snapshots and check deployment logs.")
+    return state
+
+
+def _write_restore_state(state: dict | None) -> None:
+    path = BACKUP_DIR / RESTORE_STATE_NAME
+    if state is None:
+        path.unlink(missing_ok=True)
+    else:
+        _atomic_write_text(path, json.dumps(state) + "\n")
+    fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _prune_pre_restore_snapshots(protected_name: str | None = None) -> None:
+    pending = _restore_state()
     snaps = sorted(BACKUP_DIR.glob("pre-restore-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
     for stale in snaps[PRE_RESTORE_KEEP:]:
+        if stale.name == protected_name or (pending and stale.name == pending["snapshot"]):
+            continue
         try:
             stale.unlink()
         except OSError:
@@ -3110,7 +3436,7 @@ _BACKUP_EXCLUDED_DIRS = {
 # Without this mirror a *.db under any of the three is demanded by
 # _live_db_names() while `hermes backup` deliberately omits it, and the resulting
 # false "incomplete" ABORTS a restore.
-_BACKUP_EXCLUDED_ROOT_DIRS = {"models", "runtimes", "node"}
+_BACKUP_EXCLUDED_ROOT_DIRS = {"models", "runtimes", "node", "installs", "tools"}
 
 # v2026.9.21 added backup-only exclusions that are root-scoped for the same
 # reason as the runtime trees above. browser_profiles is Browser Use CLI's live
@@ -3124,7 +3450,7 @@ _BACKUP_EXCLUDED_BACKUP_ROOT_DIRS = {"browser_profiles"}
 # This mirror is deliberately positive: adding "cache" to the flat exclusions
 # would silently drop the durable directories too.
 _BACKUP_KEPT_CACHE_SUBDIRS = {
-    "images", "audio", "videos", "documents", "screenshots", "citations",
+    "images", "audio", "videos", "documents", "screenshots", "citations", "generated",
 }
 
 
@@ -3569,7 +3895,9 @@ async def api_backup_restore(request: Request) -> Response:
     if not isinstance(upload, UploadFile):
         return JSONResponse({"error": "No file uploaded"}, status_code=400)
 
-    async with backup_lock:
+    async with backup_lock, lifecycle_lock, cfg_lock:
+        if err := guard(request): return err
+        previous_preparation = dict(preparation)
         tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="hermes-restore-")
         upload_path = Path(tmp_name)
         try:
@@ -3583,6 +3911,8 @@ async def api_backup_restore(request: Request) -> Response:
             warning = None
             with zipfile.ZipFile(upload_path) as zf:
                 names = {Path(n).name for n in zf.namelist()}
+                if RESTORE_STATE_NAME in names:
+                    return JSONResponse({"error": "Archive contains local restore recovery state; it cannot be imported."}, status_code=400)
                 if not names & {"config.yaml", ".env", "state.db"}:
                     return JSONResponse(
                         {"error": "This doesn't look like a hermes backup (no config.yaml/.env/state.db found)"},
@@ -3610,6 +3940,8 @@ async def api_backup_restore(request: Request) -> Response:
             # "pre-restore-*" deliberately does not match hermes' own
             # "hermes-backup-" prefix, so its v2026.9.11 `--keep 3` auto-prune
             # never touches these; _prune_pre_restore_snapshots() owns them.
+            preparation.update(state="running", phase="safety_backup", message="Creating the pre-restore safety snapshot…")
+            print("[restore] creating pre-restore safety snapshot", flush=True)
             rc, output = await _run_hermes_cli("backup", "-o", str(snap_path))
             # A lock collision is transient and retryable — say so, instead of
             # reporting it as "the backup command failed", which reads as data
@@ -3635,46 +3967,94 @@ async def api_backup_restore(request: Request) -> Response:
                      "output": output[-2000:]},
                     status_code=500,
                 )
-            _prune_pre_restore_snapshots()
-
-            await gw.stop()
-            await dash.stop()
+            _, error = await _gateway_maintenance_check()
+            if error is not None:
+                return error
+            pending_restore = _restore_state()
+            _prune_pre_restore_snapshots(protected_name=snap_path.name)
+            # Keep the original complete copy across failed recovery attempts;
+            # a new snapshot may describe an already partially imported home.
+            restore_state = {"phase": "importing", "snapshot": pending_restore["snapshot"] if pending_restore else snap_path.name}
             try:
-                rc, output = await _run_hermes_cli("import", str(upload_path), "--force")
-            finally:
-                # An imported archive can carry the legacy `pairing/` layout,
-                # which leaves two populated pairing dirs. Collapse them before
-                # anything reads the store again — hermes' own merge would
-                # otherwise keep resurrecting revoked users from the leftover.
+                _write_restore_state(restore_state)
+            except (OSError, ValueError) as publication_error:
+                # The rename can succeed before directory fsync fails. No
+                # importer ran, so restore the prior authority if it can be
+                # made durable; otherwise keep activation gated.
                 try:
-                    _consolidate_pairing_dirs()
-                except Exception as e:
-                    print(f"[pairing] consolidate after restore failed: {e!r}", flush=True)
-                # A restored .env is the only realistic way HERMES_PARENT_PID
-                # reaches this volume, and the dashboard is restarted just
-                # below — strip it before that spawn, not at the next boot.
+                    _write_restore_state(pending_restore)
+                except (OSError, ValueError) as rollback_error:
+                    # Rollback may itself remove/replace the marker before its
+                    # sync fails. Leave the importing gate present if possible.
+                    try:
+                        _write_restore_state(restore_state)
+                    except (OSError, ValueError) as gate_error:
+                        print(f"[restore] recovery record durability remains uncertain: {gate_error}", flush=True)
+                    message = f"No import was started, but restore recovery state could not be made durable: {rollback_error}. Keep the safety snapshot and check deployment logs."
+                    preparation.update(state="failed", phase="failed", requires_restore=True, message=message)
+                    return JSONResponse({"error": message}, status_code=503)
+                preparation.update(previous_preparation)
+                return JSONResponse({"error": f"No import was started; the prior restore recovery state was retained: {publication_error}"}, status_code=503)
+            global _xai_oauth_state
+            _xai_oauth_state = None  # An earlier OAuth poll must not overwrite restored credentials.
+            preparation.update(state="running", phase="restore", message="Stopping Hermes before import…")
+            # Close native lifecycle admission before stopping the real root
+            # gateway. A detached native restart may not be self.proc.
+            try:
+                dashboard_stopped = await dash.stop()
+                await _stop_gateway_for_maintenance(dashboard_stopped=dashboard_stopped)
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                preparation.update(previous_preparation)
                 try:
-                    _sanitize_env_file()
-                except Exception as e:
-                    print(f"[server] .env sanitize after restore failed: {e!r}", flush=True)
-                # Always bring the dashboard back; only auto-start the gateway if
-                # the (possibly just-restored) config is actually complete — same
-                # rule auto_start() uses on boot. This runs even if the import
-                # itself failed, so a bad upload doesn't leave the bot down too.
-                await dash.start()
-                if is_config_complete():
-                    await gw.start()
-
+                    _write_restore_state(pending_restore)
+                except (OSError, ValueError) as rollback_error:
+                    message = f"No import was started, but the restore recovery record could not be reset: {rollback_error}. Keep the safety snapshot and check deployment logs."
+                    preparation.update(state="failed", phase="failed", requires_restore=True, message=message)
+                    return JSONResponse({"error": message}, status_code=503)
+                # A failed recovery can already contain partial imported data.
+                # Only resume a previously ready, unchanged installation.
+                if (previous_preparation["state"] == "ready"
+                        and not previous_preparation.get("requires_restore")
+                        and await dash.start() is False):
+                    preparation.update(state="failed", phase="failed", requires_restore=False,
+                                       message="No import was started, but Dashboard could not restart. Retry preparation after checking deployment logs.")
+                return JSONResponse({"error": str(exc)}, status_code=503)
+            preparation.update(state="running", phase="restore", message="Importing backup; Hermes is stopped…")
+            rc, output = await _run_hermes_cli("import", str(upload_path), "--force")
             if rc != 0:
-                return JSONResponse({"error": "Restore failed", "output": output[-2000:]}, status_code=500)
+                preparation.update(state="failed", phase="failed", requires_restore=True,
+                                   message="Restore did not finish. Restore the pre-restore safety snapshot before starting Hermes.")
+                return JSONResponse({"error": preparation["message"], "output": output[-2000:]}, status_code=500)
+            _write_restore_state({**restore_state, "phase": "imported"})
+            # Import can restore an older schema after native boot maintenance
+            # has already completed for this exact code identity. Migrate it
+            # explicitly before either child reads the restored state. Run the
+            # bounded worker after this response so a slow PM refresh does not
+            # turn a successful import into a proxy timeout.
+            global _preparation_task, _preparation_mode
+            _preparation_mode = "restore"
+            preparation.update(state="running", phase="restore", message="Archive imported; preparing restored Hermes state…")
+            _preparation_task = asyncio.create_task(_initialize_hermes("restore"))
 
-            resp = {"ok": True, "output": output[-2000:]}
+            resp = {"ok": True, "preparing": True, "output": output[-2000:]}
             if warning:
                 resp["warning"] = warning
             return JSONResponse(resp)
+        except asyncio.CancelledError:
+            if preparation["phase"] == "restore":
+                preparation.update(state="failed", phase="failed", requires_restore=True,
+                                   message="Restore was interrupted. Restore the pre-restore safety snapshot before starting Hermes.")
+            raise
         except Exception as e:
+            if preparation["state"] == "running" and preparation["phase"] == "restore":
+                preparation.update(state="failed", phase="failed", requires_restore=True,
+                                   message=f"Restore was interrupted: {e}. Keep the pre-restore safety snapshot and check deployment logs.")
             return JSONResponse({"error": str(e)}, status_code=500)
         finally:
+            # Before the importing marker is published, the home is unchanged.
+            # A failed/busy/cancelled safety copy must not strand a loading state.
+            if preparation["phase"] == "safety_backup":
+                preparation.update(previous_preparation)
             upload_path.unlink(missing_ok=True)
 
 
@@ -3695,8 +4075,8 @@ BACK_TO_SETUP_WIDGET = (
 )
 
 # Dashboard actions that can install software at runtime. Their persistence is
-# provider-specific: Hermes pip/lazy packages go to /data/.hermes/lazy-packages,
-# while some tool post-setup hooks still mutate the disposable image.
+# provider-specific: PM selections and tool installs can live on the data
+# volume, while some provider hooks still mutate the disposable image.
 # MCP catalog install is deliberately NOT here: it installs under
 # $HERMES_HOME/mcp-installs on the volume, so it does survive a redeploy.
 _IN_CONTAINER_INSTALL_RE = re.compile(
@@ -3869,7 +4249,7 @@ a:hover{border-color:#6272ff}</style></head>
 <h1>⚠ Could not sign in to the Hermes dashboard</h1>
 <p>The admin panel is fine — only the embedded dashboard rejected our sign-in.</p>
 <p>This usually means the admin password changed after the dashboard started.
-Restart the gateway from Status (that restarts the dashboard too), or redeploy.</p>
+Use Apply dependencies from Status to restart the Hermes processes, or redeploy.</p>
 <a href="/setup">← Back to Setup</a>
 </div></body></html>"""
 
@@ -3946,8 +4326,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
         user, _ = hermes_dashboard_credentials()
         print(f"[dashboard-auth] still unauthenticated after signing in as {user!r} — "
               f"{request.method} {request.url.path}. The dashboard subprocess was started "
-              f"with different credentials; restart the gateway from Status (that restarts "
-              f"the dashboard too) or redeploy.", flush=True)
+              f"with different credentials; use Apply dependencies from Status or redeploy.", flush=True)
         return HTMLResponse(DASHBOARD_AUTH_FAILED_HTML, status_code=502)
 
     # Surface non-2xx responses from hermes into Railway logs so we can
@@ -4002,6 +4381,8 @@ async def route_root(request: Request) -> Response:
     - Non-GET (SPA API calls, etc.) always proxy through.
     """
     if err := guard(request): return err
+    if preparation["state"] != "ready":
+        return RedirectResponse("/setup", status_code=302)
     if (request.method == "GET"
             and request.query_params.get("force") != "1"
             and not is_config_complete()):
@@ -4012,6 +4393,16 @@ async def route_root(request: Request) -> Response:
 async def route_proxy(request: Request) -> Response:
     """Catch-all: forward any unmatched path to the Hermes dashboard."""
     if err := guard(request): return err
+    if request.method == "POST" and (
+        request.url.path in NATIVE_GATEWAY_LIFECYCLE_PATHS
+        or NATIVE_GATEWAY_ONBOARDING_PATH.fullmatch(request.url.path)
+    ):
+        # Native routes launch detached lifecycle commands. Serialize their
+        # admission with Save/Apply/Restore, then maintenance checks the native
+        # action registry before stopping Dashboard and touching user state.
+        async with lifecycle_lock:
+            if err := guard(request): return err
+            return await _proxy_to_dashboard(request)
     # Leave a trail when an in-container install runs: the browser already got
     # the confirm() from IMMUTABLE_INSTALL_WARNING_JS, but this is the only
     # record in `railway logs` explaining why a provider works now and breaks
@@ -4037,41 +4428,55 @@ async def route_setup_404(request: Request) -> Response:
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
-async def auto_start():
-    if is_config_complete():
-        asyncio.create_task(gw.start())
-    else:
-        print("[server] Config incomplete — gateway not started. Configure provider + model in the admin UI.", flush=True)
+async def _initialize_hermes(mode: str = "startup"):
+    async with backup_lock, lifecycle_lock:
+        try:
+            try:
+                pending = _restore_state()
+            except (OSError, ValueError) as exc:
+                preparation.update(state="failed", phase="failed", requires_restore=True, message=str(exc))
+                return
+            if pending and pending["phase"] == "importing":
+                preparation.update(state="failed", phase="failed", requires_restore=True,
+                                   message=f"A restore was interrupted. Restore safety snapshot {pending['snapshot']} before starting Hermes.")
+                return
+            if pending:
+                mode = "restore"
+            async with cfg_lock:
+                if not await _prepare_hermes(mode):
+                    return
+                _sanitize_env_file()
+                _consolidate_pairing_dirs()
+                if pending:
+                    _write_restore_state(None)
+            if await dash.start() is False:
+                raise RuntimeError("Dashboard could not start. Check deployment logs.")
+            if is_config_complete():
+                if await gw.start() is False:
+                    raise RuntimeError("Gateway could not start. Check Logs.")
+            else:
+                print("[server] Configure a provider and model in Setup to start the gateway.", flush=True)
+        except Exception as exc:
+            preparation.update(state="failed", phase="failed", message=str(exc))
+            print(f"[preparation] ERROR: {exc}", flush=True)
 
 
 @asynccontextmanager
 async def lifespan(app):
+    global _preparation_task
     _sweep_stale_backup_tmpdirs()
     try:
         _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
     except (OSError, ValueError) as exc:
         print(f"[backup-job] could not reconcile jobs at boot: {exc}", flush=True)
-    # Strip .env keys that would make hermes shut its own dashboard down before
-    # we spawn it — same "heal the volume before anything reads it" slot as the
-    # pairing consolidation below.
-    try:
-        _sanitize_env_file()
-    except Exception as e:
-        print(f"[server] .env sanitize at boot failed: {e!r}", flush=True)
-    # Heal a pairing store split across the legacy and consolidated dirs before
-    # anything reads it. Only a restore can create that here, but an earlier
-    # restore (or a volume carried over from a pre-fix deploy) may already have.
-    try:
-        _consolidate_pairing_dirs()
-    except Exception as e:
-        print(f"[pairing] consolidate at boot failed: {e!r}", flush=True)
-    # Dashboard runs always — it's the user-facing UI after setup is done,
-    # and it's independent of gateway state.
-    asyncio.create_task(dash.start())
-    await auto_start()
+    preparation.update(state="running", phase="starting", message="Preparing Hermes…")
+    _preparation_task = asyncio.create_task(_initialize_hermes())
     try:
         yield
     finally:
+        if _preparation_task is not None:
+            _preparation_task.cancel()
+            await asyncio.gather(_preparation_task, return_exceptions=True)
         if _manual_backup_task is not None:
             _manual_backup_task.cancel()
             await asyncio.gather(_manual_backup_task, return_exceptions=True)
@@ -4206,6 +4611,9 @@ async def ws_proxy(websocket: WebSocket) -> None:
       5. When either direction ends (client navigates away, upstream PTY
          exits, etc.), cancel the other task and close both sockets
     """
+    if preparation["state"] != "ready":
+        await websocket.close(code=1013)
+        return
     # 1. Edge auth.
     if not _is_authenticated(websocket):
         # Close before accept — browser sees the handshake fail (expected
@@ -4310,6 +4718,8 @@ routes = [
     Route("/setup/api/config",                  api_config_get,      methods=["GET"]),
     Route("/setup/api/config",                  api_config_put,      methods=["PUT"]),
     Route("/setup/api/status",                  api_status),
+    Route("/setup/api/preparation/retry",       api_preparation_retry, methods=["POST"]),
+    Route("/setup/api/dependencies/apply",      api_dependencies_apply, methods=["POST"]),
     Route("/setup/api/logs",                    api_logs),
     Route("/setup/api/gateway/start",           api_gw_start,        methods=["POST"]),
     Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),

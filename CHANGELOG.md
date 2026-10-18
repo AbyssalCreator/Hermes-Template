@@ -11,6 +11,22 @@ release.
 
 ---
 
+## release/v0.22.2/1 — October 17, 2026
+**Hermes v0.22.2 · major (Hermes upgrade, from v2026.9.24)**
+
+### Hermes update
+- Hermes Agent v2026.9.24 → v0.22.2, with the release’s managed Python and toolchain built into the image.
+- Email accounts using authenticated senders need Receiving MTA authserv-id in the native Channels → Email settings. Setup highlights missing pins; test with a new email after saving.
+- Several integrations now come from Hermes’ plugin catalog. Startup checks selected integrations and shows missing-plugin recovery commands; existing customized plugins are preserved. Older Hindsight plugins may need a reviewed update before setup or repair.
+
+### Changes to support upstream updates
+- Setup stays available while dependencies and root/named-profile settings are prepared. Progress, warnings, failures and retry controls are visible; chat starts after preparation completes.
+- Setup saves, provider changes and removal use Hermes’ new config rules while preserving unrelated settings and refusing damaged YAML.
+- Apply dependencies restarts the dashboard and a running gateway without changing configuration. A stopped gateway stays stopped and paused bots stay paused.
+- Restore prepares and migrates the imported root and named profiles before restarting Hermes. Preparation failures leave chat stopped and the safety snapshot available; an interrupted import stays blocked across redeploys until recovered.
+
+---
+
 ## release/v2026.9.24/2 — October 15, 2026
 **Hermes v2026.9.24 · minor**
 

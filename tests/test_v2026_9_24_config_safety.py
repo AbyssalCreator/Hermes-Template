@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-import yaml
+import hermes_yaml as yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
