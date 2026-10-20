@@ -1,17 +1,17 @@
+#!/usr/bin/env python3
 """Prepare the template image using the pinned release's own PM/build APIs."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 
-
-PAYLOAD = Path("/opt/hermes")
+PAYLOAD = Path(os.environ.get("HERMES_ROOT") or "/home/container/hermes")
 SOURCE = PAYLOAD / "repo"
 ENVIRONMENT = PAYLOAD / "venv"
 WRAPPER = PAYLOAD / "wrapper-venv"
@@ -43,8 +43,6 @@ def tools() -> None:
                           project=SOURCE / "pm", cache=PAYLOAD / "uv-cache")
     seal_pm_runtime(PAYLOAD, python)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SOURCE, text=True).strip()
-    # pyproject intentionally declares 0.0.0. Match the official Docker workflow:
-    # resolve the release identity from Git, then persist it before removing Git.
     try:
         display = dev_version(SOURCE)
     except NoReleaseTag:
@@ -71,8 +69,6 @@ def dependencies() -> None:
         "--cache", PAYLOAD / "uv-cache", "--out", ENVIRONMENT,
         "--no-install-project", "--sealed", "--record-selection",
         *(arg for extra in EXTRAS for arg in ("--extra", extra)))
-    # The parent owns a fixed image environment. It never activates a writable PM
-    # generation; its explicit .pth reuses only the immutable, frozen base graph.
     run(sys.executable, "-m", "venv", "--without-pip", WRAPPER)
     site = next(ENVIRONMENT.glob("lib/python*/site-packages"))
     wrapper_site = next(WRAPPER.glob("lib/python*/site-packages"))
@@ -102,8 +98,6 @@ def frontends() -> None:
         "--icons", "/tmp/hermes-icons", "--out", "/tmp/hermes-products/web")
     shutil.copytree("/tmp/hermes-products/tui", PAYLOAD / "ui-tui")
     shutil.copytree("/tmp/hermes-products/web", SOURCE / "hermes_cli/web_dist", dirs_exist_ok=True)
-    # Keep TypeScript for the native linting feature; bundler dependencies are
-    # build inputs, and the compiled TUI includes its runtime JS dependencies.
     typescript = Path("/tmp/hermes-typescript")
     shutil.move(SOURCE / "node_modules/typescript", typescript)
     for name in ("node_modules", "web", "ui-tui"):
@@ -131,15 +125,11 @@ def assemble() -> None:
         frontends={"tui": PAYLOAD / "ui-tui", "web": SOURCE / "hermes_cli/web_dist"},
         stamp=SOURCE / "install-stamp.json",
     ), PAYLOAD)
-    # The generic assembler's inline bootstrap is not recognized by this
-    # release's live gateway identity matcher. Use the native publisher for
-    # both PATH commands and installation_command()'s source-local commands.
     for directory in (PAYLOAD / "bin", SOURCE / ".hermes/bin"):
         directory.mkdir(parents=True, exist_ok=True)
         for name in ("hermes", "hermes-acp"):
             if stage_launcher(name, SOURCE, directory) is None:
                 raise RuntimeError(f"Cannot publish native launcher: {directory / name}")
-    # Retain the template's established code path for migration hooks/operators.
     Path("/opt/hermes-agent").symlink_to(SOURCE, target_is_directory=True)
     shutil.rmtree(SOURCE / ".git")
 
@@ -168,9 +158,6 @@ with tempfile.TemporaryDirectory() as directory:
         assert db.execute("SELECT count(*) FROM docs WHERE docs MATCH 'erm'").fetchone()[0] == 1
         assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
 """
-    # The PM Python embeds SQLite3.53.1. It already includes the WAL-reset fix
-    # (SQLite3.51.3/3.53.0); replacing the distro shared library cannot affect it.
-    # Exercise Hermes' actual FTS triggers/flush probe, rather than only imports.
     native_check = f"""
 sys.path.insert(0, {str(SOURCE)!r})
 from pm.environments import activate_dependencies
@@ -191,14 +178,12 @@ with tempfile.TemporaryDirectory() as directory:
         assert conn.execute('SELECT count(*) FROM messages').fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH 'erm'").fetchone()[0] == 1
 print(json.dumps({{'python': sys.executable, 'sqlite': sqlite3.sqlite_version,
-                  'wal_fts5_trigram_integrity': 'ok', 'native_write_health_flush': 'ok'}}))
+                   'wal_fts5_trigram_integrity': 'ok', 'native_write_health_flush': 'ok'}}))
 """
-    check_env = {**os.environ, "HERMES_HOME": "/tmp/hermes-image-check",
-                 "HERMES_DISABLE_LAZY_INSTALLS": "1"}
+    check_env = {**os.environ, "HERMES_HOME": "/tmp/hermes-image-check", "HERMES_DISABLE_LAZY_INSTALLS": "1"}
     expected_sqlite = "3.53.1" if os.environ.get("HERMES_REF") == "v0.22.2" else ""
     for executable in (installed_package("python").binary, ENVIRONMENT / "bin/python", WRAPPER / "bin/python"):
         run(executable, "-I", "-c", sqlite_check + native_check, expected_sqlite, env=check_env)
-    # Keep the fixed shared library for distro Python and other dynamic clients.
     run("/usr/bin/python3", "-I", "-c", sqlite_check, "3.53.4")
     run(ENVIRONMENT / "bin/python", "-I", "-c", """
 import shlex
@@ -212,8 +197,6 @@ for directory in (Path('/opt/hermes/bin'), Path('/opt/hermes/repo/.hermes/bin'))
         assert _gateway_command_subcommand(' '.join(command)) == verb, directory
 """)
     run(PAYLOAD / "bin/hermes", "--version", env=check_env)
-    # A fresh native detached action selects the bare store interpreter. Verify
-    # that it can activate the recognized base before any writable generation.
     run(python, "-I", "-c",
         f"import sys; from pathlib import Path; sys.path.insert(0, {str(SOURCE)!r}); "
         f"from pm.environments import activate_dependencies; activate_dependencies(Path({str(SOURCE)!r})); "
