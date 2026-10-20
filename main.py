@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 try:
@@ -17,8 +16,12 @@ except Exception:
 
 REPO_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+HERMES_ROOT = Path(os.environ.get("HERMES_ROOT", "/home/container/hermes"))
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(DATA_DIR / ".hermes")))
 DEFAULT_HERMES_REF = os.environ.get("HERMES_REF", "v0.22.2")
+HERMES_REPO_ROOT = HERMES_ROOT / "repo"
+HERMES_RUNTIME_DIR = HERMES_ROOT / "tools"
+HERMES_TUI_DIR = HERMES_ROOT / "ui-tui"
 
 
 def log(msg: str) -> None:
@@ -56,14 +59,14 @@ def ensure_git() -> None:
 
 
 def ensure_hermes_repo() -> None:
-    hermes_root = Path("/opt/hermes")
-    hermes_repo = hermes_root / "repo"
+    hermes_root = HERMES_ROOT
+    hermes_repo = HERMES_REPO_ROOT
     hermes_ref = os.environ.get("HERMES_REF", DEFAULT_HERMES_REF)
 
     hermes_root.mkdir(parents=True, exist_ok=True)
 
     if not hermes_repo.exists():
-        log(f"Cloning Hermes Agent {hermes_ref} into /opt/hermes/repo...")
+        log(f"Cloning Hermes Agent {hermes_ref} into {hermes_repo}...")
         run([
             "git",
             "clone",
@@ -133,13 +136,15 @@ def set_hermes_env() -> None:
     os.environ.setdefault("HOST", "0.0.0.0")
     os.environ.setdefault("ADMIN_USERNAME", "admin")
     os.environ.setdefault("HOME", str(DATA_DIR))
+    os.environ.setdefault("HERMES_ROOT", str(HERMES_ROOT))
     os.environ.setdefault("HERMES_HOME", str(HERMES_HOME))
-    os.environ.setdefault("HERMES_RUNTIME_DIR", "/opt/hermes/tools")
-    os.environ.setdefault("HERMES_TUI_DIR", "/opt/hermes/ui-tui")
+    os.environ.setdefault("HERMES_REPO_ROOT", str(HERMES_REPO_ROOT))
+    os.environ.setdefault("HERMES_RUNTIME_DIR", str(HERMES_RUNTIME_DIR))
+    os.environ.setdefault("HERMES_TUI_DIR", str(HERMES_TUI_DIR))
     os.environ.setdefault("LD_LIBRARY_PATH", "/usr/local/lib")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    os.environ.setdefault("PATH", "/opt/hermes/bin:/opt/hermes/wrapper-venv/bin:" + os.environ.get("PATH", ""))
+    os.environ.setdefault("PATH", f"{HERMES_ROOT / 'bin'}:{HERMES_ROOT / 'wrapper-venv' / 'bin'}:" + os.environ.get("PATH", ""))
 
     if not os.environ.get("ADMIN_PASSWORD"):
         import secrets
@@ -148,7 +153,7 @@ def set_hermes_env() -> None:
 
 
 def build_hermes_runtime() -> None:
-    hermes_repo = Path("/opt/hermes/repo")
+    hermes_repo = HERMES_REPO_ROOT
     if not hermes_repo.exists():
         ensure_hermes_repo()
 
