@@ -14,10 +14,24 @@ except Exception:
     import uvicorn
 
 
-REPO_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-HERMES_ROOT = Path(os.environ.get("HERMES_ROOT", "/home/container/hermes"))
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(DATA_DIR / ".hermes")))
+def _writable_fallback(*candidates: str) -> Path:
+    for candidate in candidates:
+        path = Path(candidate)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            test = path / ".write_test"
+            test.write_text("ok", encoding="utf-8")
+            test.unlink()
+            return path
+        except Exception:
+            continue
+    return Path.home() / "hermes"
+
+
+HOME_ROOT = Path.home()
+DATA_DIR = Path(os.environ.get("DATA_DIR") or str(_writable_fallback("/home/container/data", "/tmp/hermes-data", str(HOME_ROOT / "data"))))
+HERMES_ROOT = Path(os.environ.get("HERMES_ROOT") or str(_writable_fallback("/home/container/hermes", "/tmp/hermes", str(HOME_ROOT / "hermes"))))
+HERMES_HOME = Path(os.environ.get("HERMES_HOME") or str(_writable_fallback("/home/container/.hermes", "/tmp/.hermes", str(HOME_ROOT / ".hermes"))))
 DEFAULT_HERMES_REF = os.environ.get("HERMES_REF", "v0.22.2")
 HERMES_REPO_ROOT = HERMES_ROOT / "repo"
 HERMES_RUNTIME_DIR = HERMES_ROOT / "tools"
@@ -63,21 +77,38 @@ def ensure_hermes_repo() -> None:
     hermes_repo = HERMES_REPO_ROOT
     hermes_ref = os.environ.get("HERMES_REF", DEFAULT_HERMES_REF)
 
-    hermes_root.mkdir(parents=True, exist_ok=True)
+    try:
+        hermes_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fallback = _writable_fallback(str(Path.home() / "hermes"))
+        os.environ["HERMES_ROOT"] = str(fallback)
+        global HERMES_ROOT, HERMES_REPO_ROOT, HERMES_RUNTIME_DIR, HERMES_TUI_DIR
+        HERMES_ROOT = fallback
+        HERMES_REPO_ROOT = HERMES_ROOT / "repo"
+        HERMES_RUNTIME_DIR = HERMES_ROOT / "tools"
+        HERMES_TUI_DIR = HERMES_ROOT / "ui-tui"
+        hermes_root = HERMES_ROOT
+        hermes_repo = HERMES_REPO_ROOT
+        log(f"Falling back to writable Hermes root: {hermes_root}")
+        hermes_root.mkdir(parents=True, exist_ok=True)
 
     if not hermes_repo.exists():
         log(f"Cloning Hermes Agent {hermes_ref} into {hermes_repo}...")
-        run([
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            hermes_ref,
-            "https://github.com/NousResearch/hermes-agent.git",
-            str(hermes_repo),
-        ], check=True)
-        return
+        try:
+            run([
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                hermes_ref,
+                "https://github.com/NousResearch/hermes-agent.git",
+                str(hermes_repo),
+            ], check=True)
+            return
+        except Exception:
+            log(f"Hermes clone failed for {hermes_ref}; continuing without upstream runtime bootstrap.")
+            return
 
     if shutil.which("git") is not None:
         try:
@@ -91,7 +122,15 @@ def ensure_hermes_repo() -> None:
 
 
 def ensure_hermes_home_layout() -> None:
-    HERMES_HOME.mkdir(parents=True, exist_ok=True)
+    try:
+        HERMES_HOME.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        fallback = _writable_fallback(str(Path.home() / ".hermes"), "/tmp/.hermes")
+        os.environ["HERMES_HOME"] = str(fallback)
+        global HERMES_HOME
+        HERMES_HOME = fallback
+        HERMES_HOME.mkdir(parents=True, exist_ok=True)
+
     for rel in [
         "cron",
         "sessions",
@@ -136,6 +175,7 @@ def set_hermes_env() -> None:
     os.environ.setdefault("HOST", "0.0.0.0")
     os.environ.setdefault("ADMIN_USERNAME", "admin")
     os.environ.setdefault("HOME", str(DATA_DIR))
+    os.environ.setdefault("DATA_DIR", str(DATA_DIR))
     os.environ.setdefault("HERMES_ROOT", str(HERMES_ROOT))
     os.environ.setdefault("HERMES_HOME", str(HERMES_HOME))
     os.environ.setdefault("HERMES_REPO_ROOT", str(HERMES_REPO_ROOT))
@@ -159,7 +199,7 @@ def build_hermes_runtime() -> None:
 
     build_script = hermes_repo / "build_hermes_image.py"
     if not build_script.exists():
-        log("Hermes repo is missing build_hermes_image.py; cannot assemble runtime.")
+        log("Hermes runtime build script not present in cloned repo; skipping native runtime assembly.")
         return
 
     log("Building Hermes runtime components (tools / dependencies / frontends / assemble)...")
@@ -201,6 +241,9 @@ def get_server_app():
     if app is None:
         raise RuntimeError("server.py does not expose an ASGI app at 'app' or 'application'.")
     return app
+
+
+REPO_DIR = Path(__file__).resolve().parent
 
 
 def main() -> None:
